@@ -4,6 +4,7 @@
 # build output
 /dist
 /coverage
+/data
 
 # environment files
 .env

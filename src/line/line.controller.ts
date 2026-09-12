@@ -1,4 +1,4 @@
-import { BadRequestException, Controller, Headers, Post, Req } from '@nestjs/common';
+import { BadRequestException, Controller, Headers, Logger, Post, Req } from '@nestjs/common';
 import { validateSignature } from '@line/bot-sdk';
 import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
@@ -9,6 +9,8 @@ type RawBodyRequest = Request & { body: Buffer };
 
 @Controller('line')
 export class LineController {
+  private readonly logger = new Logger(LineController.name);
+
   constructor(
     private readonly config: ConfigService,
     private readonly lineService: LineService,
@@ -26,6 +28,7 @@ export class LineController {
     }
 
     const body = JSON.parse(request.body.toString('utf8')) as LineWebhookBody;
+    this.logger.log(`Accepted LINE webhook with ${body.events?.length ?? 0} event(s)`);
     await this.lineService.handleWebhook(body);
     return { ok: true };
   }

@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { mkdir, readFile, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
-import { ReminderRecord, ReminderStatus } from './reminder.types';
+import { ReminderQuery, ReminderRecord, ReminderStatus } from './reminder.types';
 
 @Injectable()
 export class ReminderStore implements OnModuleInit {
@@ -44,6 +44,18 @@ export class ReminderStore implements OnModuleInit {
 
   async list() {
     return [...this.records];
+  }
+
+  async queryByTarget(targetId: string, query: ReminderQuery) {
+    const now = Date.now();
+
+    return this.records
+      .filter((record) => record.targetId === targetId && this.matchesQuery(record, query, now))
+      .sort((left, right) => new Date(left.dueAt).getTime() - new Date(right.dueAt).getTime());
+  }
+
+  async getById(targetId: string, id: string) {
+    return this.records.find((record) => record.targetId === targetId && record.id === id);
   }
 
   private async load() {
@@ -92,7 +104,13 @@ export class ReminderStore implements OnModuleInit {
 
     try {
       await this.onDue?.(record);
-      await this.updateStatus(id, 'sent');
+      if (record.recurrence) {
+        this.advanceRecurring(record);
+        await this.save();
+        this.schedule(record);
+      } else {
+        await this.updateStatus(id, 'sent');
+      }
     } catch (error) {
       this.logger.error(`Failed to send reminder ${id}`, error);
       this.schedule(record);
@@ -105,5 +123,79 @@ export class ReminderStore implements OnModuleInit {
       clearTimeout(timer);
       this.timers.delete(id);
     }
+  }
+
+  private matchesQuery(record: ReminderRecord, query: ReminderQuery, now: number) {
+    if (!query.includeFinished && record.status !== 'pending') {
+      return false;
+    }
+
+    if (query.recurrence === 'recurring') {
+      if (!record.recurrence) {
+        return false;
+      }
+    }
+
+    if (query.recurrence === 'non-recurring') {
+      if (record.recurrence) {
+        return false;
+      }
+    }
+
+    const dueAt = new Date(record.dueAt).getTime();
+
+    if (query.overdueOnly && dueAt >= now) {
+      return false;
+    }
+
+    if (query.dueFrom && dueAt < new Date(query.dueFrom).getTime()) {
+      return false;
+    }
+
+    if (query.dueTo && dueAt > new Date(query.dueTo).getTime()) {
+      return false;
+    }
+
+    if (query.titleContains && !record.title.toLowerCase().includes(query.titleContains.toLowerCase())) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private advanceRecurring(record: ReminderRecord) {
+    record.lastSentAt = new Date().toISOString();
+    record.dueAt = this.getNextDueAt(record);
+    record.updatedAt = new Date().toISOString();
+  }
+
+  private getNextDueAt(record: ReminderRecord) {
+    if (!record.recurrence) {
+      return record.dueAt;
+    }
+
+    const due = new Date(record.dueAt);
+
+    if (record.recurrence.frequency === 'daily') {
+      due.setDate(due.getDate() + record.recurrence.interval);
+      return due.toISOString();
+    }
+
+    const daysOfWeek = record.recurrence.daysOfWeek;
+    if (!daysOfWeek?.length) {
+      due.setDate(due.getDate() + 7 * record.recurrence.interval);
+      return due.toISOString();
+    }
+
+    const currentDay = due.getDay();
+    const dayOffsets = daysOfWeek
+      .map((day) => {
+        const offset = (day - currentDay + 7) % 7;
+        return offset === 0 ? 7 * record.recurrence!.interval : offset;
+      })
+      .sort((left, right) => left - right);
+
+    due.setDate(due.getDate() + dayOffsets[0]);
+    return due.toISOString();
   }
 }
