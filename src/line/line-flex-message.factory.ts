@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
-import { ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
+import { ReminderEditPatch, ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
 import { LINE_USER_MESSAGES } from './line-user-messages';
 
 @Injectable()
@@ -154,6 +154,75 @@ export class LineFlexMessageFactory {
     };
   }
 
+  buildEditConfirmationMessage(record: ReminderRecord, patch: ReminderEditPatch, token: string): messagingApi.FlexMessage {
+    const next = this.previewEditedRecord(record, patch);
+
+    return {
+      type: 'flex',
+      altText: `ยืนยันแก้ไข: ${record.title}`,
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'md',
+          contents: [
+            {
+              type: 'text',
+              text: 'ยืนยันแก้ไข?',
+              weight: 'bold',
+              size: 'lg',
+            },
+            { type: 'separator', margin: 'sm' },
+            {
+              type: 'text',
+              text: 'เดิม',
+              weight: 'bold',
+              size: 'sm',
+              color: '#667085',
+              margin: 'md',
+            },
+            this.textLine(record.title),
+            this.textLine(`${this.formatDate(record.dueAt, record.timezone)} ${this.formatTime(record.dueAt, record.timezone)}`),
+            ...(record.recurrence ? [this.textLine(this.formatRecurrence(record))] : []),
+            {
+              type: 'text',
+              text: 'ใหม่',
+              weight: 'bold',
+              size: 'sm',
+              color: '#1DB446',
+              margin: 'lg',
+            },
+            this.textLine(next.title),
+            this.textLine(`${this.formatDate(next.dueAt, next.timezone)} ${this.formatTime(next.dueAt, next.timezone)}`),
+            ...(next.recurrence ? [this.textLine(this.formatRecurrence(next))] : []),
+            {
+              type: 'button',
+              style: 'primary',
+              color: '#1DB446',
+              margin: 'lg',
+              action: {
+                type: 'postback',
+                label: 'ยืนยันแก้ไข',
+                data: `action=edit_confirm&token=${token}`,
+              },
+            },
+            {
+              type: 'button',
+              style: 'secondary',
+              action: {
+                type: 'postback',
+                label: 'ไม่แก้แล้ว',
+                data: `action=edit_abort&token=${token}`,
+              },
+            },
+          ],
+        },
+      },
+    };
+  }
+
   buildCancelSelectionMessage(title: string, records: ReminderRecord[]): messagingApi.FlexMessage {
     return this.buildReminderListMessage(title, records);
   }
@@ -208,6 +277,33 @@ export class LineFlexMessageFactory {
                 label: 'ทำเสร็จแล้ว',
                 data: `action=complete&id=${record.id}`,
               },
+            },
+            {
+              type: 'box',
+              layout: 'horizontal',
+              spacing: 'sm',
+              contents: [
+                {
+                  type: 'button',
+                  style: 'secondary',
+                  height: 'sm',
+                  action: {
+                    type: 'postback',
+                    label: 'เลื่อน 10 นาที',
+                    data: `action=snooze&id=${record.id}&minutes=10`,
+                  },
+                },
+                {
+                  type: 'button',
+                  style: 'secondary',
+                  height: 'sm',
+                  action: {
+                    type: 'postback',
+                    label: 'เลื่อน 1 ชม.',
+                    data: `action=snooze&id=${record.id}&minutes=60`,
+                  },
+                },
+              ],
             },
           ],
         },
@@ -447,6 +543,16 @@ export class LineFlexMessageFactory {
   private formatDayOfWeek(day: number) {
     const labels = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัส', 'ศุกร์', 'เสาร์'];
     return labels[day] ?? `วันที่ ${day}`;
+  }
+
+  private previewEditedRecord(record: ReminderRecord, patch: ReminderEditPatch): ReminderRecord {
+    return {
+      ...record,
+      title: patch.title ?? record.title,
+      dueAt: patch.dueAt ?? record.dueAt,
+      timezone: patch.timezone ?? record.timezone,
+      recurrence: patch.recurrence === undefined ? record.recurrence : patch.recurrence ?? undefined,
+    };
   }
 
   private chunk<T>(items: T[], size: number) {

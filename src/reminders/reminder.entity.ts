@@ -12,7 +12,7 @@ export class ReminderEntity {
   @Column()
   targetId: string;
 
-  @Column({ nullable: true })
+  @Column({ type: 'text', nullable: true })
   createdByUserId?: string;
 
   @Column()
@@ -28,10 +28,13 @@ export class ReminderEntity {
   timezone: string;
 
   @Column({ type: 'simple-json', nullable: true })
-  recurrence?: ReminderRecurrence;
+  recurrence?: ReminderRecurrence | null;
 
-  @Column({ nullable: true })
+  @Column({ type: 'text', nullable: true })
   lastSentAt?: string;
+
+  @Column({ type: 'text', nullable: true })
+  snoozedFromDueAt?: string | null;
 
   @Column()
   status: ReminderStatus;

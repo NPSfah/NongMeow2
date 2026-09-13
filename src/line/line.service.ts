@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { GeminiReminderParser } from '../reminders/gemini-reminder.parser';
 import { LocalCommandParser } from '../reminders/local-command.parser';
 import { ReminderStore } from '../reminders/reminder.store';
-import { BotIntent, ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
+import { BotIntent, ReminderEditPatch, ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
 import { LineFlexMessageFactory } from './line-flex-message.factory';
 import { LineMessageEvent, LinePostbackEvent, LineSource, LineWebhookBody, LineWebhookEvent } from './line.types';
 import { LINE_USER_MESSAGES } from './line-user-messages';
@@ -15,6 +15,7 @@ export class LineService implements OnModuleInit {
   private readonly logger = new Logger(LineService.name);
   private readonly client: messagingApi.MessagingApiClient;
   private readonly pendingCancelBatches = new Map<string, { targetId: string; ids: string[]; expiresAt: number }>();
+  private readonly pendingEdits = new Map<string, { targetId: string; id: string; patch: ReminderEditPatch; expiresAt: number }>();
 
   constructor(
     private readonly config: ConfigService,
@@ -112,6 +113,16 @@ export class LineService implements OnModuleInit {
       return;
     }
 
+    if (intent.intent === 'edit_reminders') {
+      try {
+        await this.handleEditIntent(event, intent.query, intent.patch);
+      } catch (error) {
+        this.logger.warn(`Could not edit reminder: ${String(error)}`);
+        await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.editFailed });
+      }
+      return;
+    }
+
     if (intent.intent === 'unknown') {
       await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.unknownIntent });
       return;
@@ -152,6 +163,7 @@ export class LineService implements OnModuleInit {
     const action = params.get('action');
     const id = params.get('id');
     const token = params.get('token');
+    const minutes = Number(params.get('minutes'));
 
     if (!action) {
       return;
@@ -183,6 +195,33 @@ export class LineService implements OnModuleInit {
       return;
     }
 
+    if (action === 'edit_abort') {
+      if (token) {
+        this.pendingEdits.delete(token);
+      }
+
+      await this.replyText(event.replyToken, LINE_USER_MESSAGES.editAborted);
+      return;
+    }
+
+    if (action === 'edit_confirm') {
+      if (!token) {
+        return;
+      }
+
+      const edit = this.pendingEdits.get(token);
+      this.pendingEdits.delete(token);
+
+      if (!edit || edit.targetId !== targetId || edit.expiresAt < Date.now()) {
+        await this.replyText(event.replyToken, LINE_USER_MESSAGES.editExpired);
+        return;
+      }
+
+      const record = await this.reminders.updateReminder(targetId, edit.id, edit.patch);
+      await this.replyText(event.replyToken, record ? LINE_USER_MESSAGES.editDone : LINE_USER_MESSAGES.reminderNotFound);
+      return;
+    }
+
     if (action === 'cancel_batch_confirm') {
       if (!token) {
         return;
@@ -198,6 +237,16 @@ export class LineService implements OnModuleInit {
 
       const records = await this.reminders.updateStatuses(targetId, batch.ids, 'cancelled');
       await this.replyText(event.replyToken, LINE_USER_MESSAGES.cancelBatchDone(records.length));
+      return;
+    }
+
+    if (action === 'snooze') {
+      if (!id || !Number.isFinite(minutes) || minutes <= 0) {
+        return;
+      }
+
+      const record = await this.reminders.snooze(targetId, id, minutes);
+      await this.replyText(event.replyToken, record ? LINE_USER_MESSAGES.snoozeDone(minutes) : LINE_USER_MESSAGES.reminderNotFound);
       return;
     }
 
@@ -315,6 +364,30 @@ export class LineService implements OnModuleInit {
     });
 
     await this.sendFinalResponse(event, this.flex.buildBatchCancelConfirmationMessage(records, token));
+  }
+
+  private async handleEditIntent(event: LineMessageEvent, query: ReminderQuery, patch: ReminderEditPatch) {
+    const records = await this.reminders.queryByTarget(this.getTargetId(event.source), query);
+
+    if (records.length === 0) {
+      await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.editNoMatch });
+      return;
+    }
+
+    if (records.length > 1) {
+      await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.editTooManyMatches });
+      return;
+    }
+
+    const token = randomUUID();
+    this.pendingEdits.set(token, {
+      targetId: this.getTargetId(event.source),
+      id: records[0].id,
+      patch,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    await this.sendFinalResponse(event, this.flex.buildEditConfirmationMessage(records[0], patch, token));
   }
 
   private async replyText(replyToken: string, text: string) {

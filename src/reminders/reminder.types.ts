@@ -21,6 +21,7 @@ export interface ReminderRecord {
   timezone: string;
   recurrence?: ReminderRecurrence;
   lastSentAt?: string;
+  snoozedFromDueAt?: string;
   status: ReminderStatus;
   createdAt: string;
   updatedAt: string;
@@ -45,6 +46,13 @@ export interface ReminderQuery {
   titleContains?: string;
 }
 
+export interface ReminderEditPatch {
+  title?: string;
+  dueAt?: string;
+  timezone?: string;
+  recurrence?: ReminderRecurrence | null;
+}
+
 export type BotIntent =
   | {
       intent: 'create_reminders';
@@ -57,6 +65,11 @@ export type BotIntent =
   | {
       intent: 'cancel_reminders';
       query: ReminderQuery;
+    }
+  | {
+      intent: 'edit_reminders';
+      query: ReminderQuery;
+      patch: ReminderEditPatch;
     }
   | {
       intent: 'unknown';

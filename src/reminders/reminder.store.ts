@@ -1,13 +1,13 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { Repository } from 'typeorm';
 import { ReminderEntity } from './reminder.entity';
-import { ReminderQuery, ReminderRecord, ReminderStatus } from './reminder.types';
+import { ReminderEditPatch, ReminderQuery, ReminderRecord, ReminderStatus } from './reminder.types';
 
 @Injectable()
-export class ReminderStore implements OnModuleInit {
+export class ReminderStore implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ReminderStore.name);
   private readonly legacyFilePath = join(process.cwd(), 'data', 'reminders.json');
   private readonly timers = new Map<string, NodeJS.Timeout>();
@@ -22,6 +22,12 @@ export class ReminderStore implements OnModuleInit {
     await this.migrateLegacyJsonIfNeeded();
     const pending = await this.reminders.find({ where: { status: 'pending' } });
     pending.forEach((record) => this.schedule(this.toRecord(record)));
+  }
+
+  onModuleDestroy() {
+    for (const id of this.timers.keys()) {
+      this.clearTimer(id);
+    }
   }
 
   setDueHandler(handler: (record: ReminderRecord) => Promise<void>) {
@@ -72,6 +78,59 @@ export class ReminderStore implements OnModuleInit {
     }
 
     return updated.map((record) => this.toRecord(record));
+  }
+
+  async updateReminder(targetId: string, id: string, patch: ReminderEditPatch) {
+    const record = await this.reminders.findOneBy({ targetId, id });
+    if (!record || record.status !== 'pending') {
+      return undefined;
+    }
+
+    const originalDueAt = record.dueAt;
+    const originalRecurrence = record.recurrence;
+
+    if (patch.title !== undefined) {
+      record.title = patch.title;
+    }
+
+    if (patch.dueAt !== undefined) {
+      record.dueAt = patch.dueAt;
+      record.snoozedFromDueAt = null;
+    }
+
+    if (patch.timezone !== undefined) {
+      record.timezone = patch.timezone;
+    }
+
+    if (patch.recurrence !== undefined) {
+      record.recurrence = patch.recurrence ?? null;
+    }
+
+    record.updatedAt = new Date().toISOString();
+    const saved = await this.reminders.save(record);
+    const result = this.toRecord(saved);
+
+    if (originalDueAt !== result.dueAt || JSON.stringify(originalRecurrence) !== JSON.stringify(result.recurrence)) {
+      this.schedule(result);
+    }
+
+    return result;
+  }
+
+  async snooze(targetId: string, id: string, minutes: number) {
+    const record = await this.reminders.findOneBy({ targetId, id });
+    if (!record) {
+      return undefined;
+    }
+
+    record.status = 'pending';
+    record.snoozedFromDueAt = record.recurrence ? record.dueAt : null;
+    record.dueAt = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+    record.updatedAt = new Date().toISOString();
+    const saved = await this.reminders.save(record);
+    const result = this.toRecord(saved);
+    this.schedule(result);
+    return result;
   }
 
   async list() {
@@ -186,10 +245,18 @@ export class ReminderStore implements OnModuleInit {
   }
 
   private advanceRecurring(record: ReminderRecord) {
+    const baseRecord = record.snoozedFromDueAt
+      ? {
+          ...record,
+          dueAt: record.snoozedFromDueAt,
+        }
+      : record;
+
     return {
       ...record,
       lastSentAt: new Date().toISOString(),
-      dueAt: this.getNextDueAt(record),
+      snoozedFromDueAt: undefined,
+      dueAt: this.getNextDueAt(baseRecord),
       updatedAt: new Date().toISOString(),
     };
   }
@@ -253,8 +320,9 @@ export class ReminderStore implements OnModuleInit {
       title: entity.title,
       dueAt: entity.dueAt,
       timezone: entity.timezone,
-      recurrence: entity.recurrence,
+      recurrence: entity.recurrence ?? undefined,
       lastSentAt: entity.lastSentAt,
+      snoozedFromDueAt: entity.snoozedFromDueAt ?? undefined,
       status: entity.status,
       createdAt: entity.createdAt,
       updatedAt: entity.updatedAt,
@@ -262,6 +330,10 @@ export class ReminderStore implements OnModuleInit {
   }
 
   private toEntity(record: ReminderRecord): ReminderEntity {
-    return this.reminders.create(record);
+    return this.reminders.create({
+      ...record,
+      recurrence: record.recurrence ?? null,
+      snoozedFromDueAt: record.snoozedFromDueAt ?? null,
+    });
   }
 }

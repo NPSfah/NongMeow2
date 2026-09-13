@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { GoogleGenAI, Type } from '@google/genai';
-import { BotIntent, ParsedReminder, ReminderQuery } from './reminder.types';
+import { BotIntent, ParsedReminder, ReminderEditPatch, ReminderQuery } from './reminder.types';
 
 @Injectable()
 export class GeminiReminderParser {
@@ -27,7 +27,7 @@ export class GeminiReminderParser {
           parts: [
             {
               text: [
-                'Classify this LINE bot message into one intent: create_reminders, list_reminders, cancel_reminders, or unknown.',
+                'Classify this LINE bot message into one intent: create_reminders, list_reminders, cancel_reminders, edit_reminders, or unknown.',
                 'The message may be Thai, English, or mixed.',
                 'Return only structured JSON that matches the schema.',
                 'If the message is addressed to the bot with a mention, ignore the mention text.',
@@ -51,6 +51,13 @@ export class GeminiReminderParser {
                 'Cancel examples include: "ยกเลิกงานประชุมพรุ่งนี้", "ลบ reminder วิ่งวันอาทิตย์", "cancel all overdue tasks", "ยกเลิกงานที่ส่งพุธหน้า".',
                 'For cancel queries, set titleContains when the user names a task, and use dueFrom/dueTo for date phrases.',
                 'For cancel queries, includeFinished should usually be false because completed/cancelled reminders do not need cancelling.',
+                'For edit_reminders: return a query object to find the existing reminder and a patch object with only the changed fields.',
+                'Edit examples include: "แก้งานประชุมพรุ่งนี้เป็นบ่ายสอง", "เปลี่ยนปลุกพรุ่งนี้เป็น 9 โมง", "edit homework reminder to Friday 6pm", "แก้ reminder วิ่งทุกอาทิตย์เป็นทุกเสาร์ 7 โมง".',
+                'For edit queries, set titleContains when the user names an existing task, and use dueFrom/dueTo for the old date/time if provided.',
+                'For edit patches, if the user only changes time or date, set patch.dueAt and keep patch.title empty.',
+                'If the user changes the title, set patch.title. If the user changes recurrence, set patch.recurrence.',
+                'If the user says to stop repeating or remove recurrence, set patch.recurrence to null.',
+                'For edit queries, includeFinished should usually be false because finished reminders should not be edited by default.',
                 `Current time: ${now}`,
                 `Timezone: ${timezone}`,
                 `Message: ${text}`,
@@ -67,7 +74,7 @@ export class GeminiReminderParser {
           properties: {
             intent: {
               type: Type.STRING,
-              description: 'create_reminders, list_reminders, cancel_reminders, or unknown.',
+              description: 'create_reminders, list_reminders, cancel_reminders, edit_reminders, or unknown.',
             },
             reminders: {
               type: Type.ARRAY,
@@ -118,7 +125,7 @@ export class GeminiReminderParser {
             query: {
               type: Type.OBJECT,
               nullable: true,
-              description: 'Only for list_reminders.',
+              description: 'Only for list_reminders, cancel_reminders, and edit_reminders.',
               properties: {
                 title: {
                   type: Type.STRING,
@@ -153,6 +160,51 @@ export class GeminiReminderParser {
                 },
               },
             },
+            patch: {
+              type: Type.OBJECT,
+              nullable: true,
+              description: 'Only for edit_reminders. Include only changed fields.',
+              properties: {
+                title: {
+                  type: Type.STRING,
+                  nullable: true,
+                  description: 'New reminder title, only if the user changes it.',
+                },
+                dueAt: {
+                  type: Type.STRING,
+                  nullable: true,
+                  description: 'New ISO 8601 date-time, only if the user changes date/time.',
+                },
+                timezone: {
+                  type: Type.STRING,
+                  nullable: true,
+                  description: 'IANA timezone for the new dueAt.',
+                },
+                recurrence: {
+                  type: Type.OBJECT,
+                  nullable: true,
+                  description: 'New recurrence rule, null to remove recurrence, omitted to keep existing recurrence.',
+                  properties: {
+                    frequency: {
+                      type: Type.STRING,
+                      description: 'daily or weekly.',
+                    },
+                    interval: {
+                      type: Type.NUMBER,
+                      description: 'Repeat interval. Use 1 for every day or every week.',
+                    },
+                    daysOfWeek: {
+                      type: Type.ARRAY,
+                      nullable: true,
+                      description: 'For weekly recurrence only. Sunday is 0 and Saturday is 6.',
+                      items: {
+                        type: Type.NUMBER,
+                      },
+                    },
+                  },
+                },
+              },
+            },
             message: {
               type: Type.STRING,
               nullable: true,
@@ -168,6 +220,22 @@ export class GeminiReminderParser {
       return {
         intent: parsed.intent,
         query: this.normalizeQuery(parsed.query, timezone),
+      };
+    }
+
+    if (parsed.intent === 'edit_reminders') {
+      const patch = this.normalizePatch(parsed.patch, timezone);
+      if (Object.keys(patch).length === 0) {
+        return {
+          intent: 'unknown',
+          message: 'no edit patch',
+        };
+      }
+
+      return {
+        intent: 'edit_reminders',
+        query: this.normalizeQuery(parsed.query, timezone),
+        patch,
       };
     }
 
@@ -249,5 +317,26 @@ export class GeminiReminderParser {
       overdueOnly: query?.overdueOnly === true,
       titleContains: query?.titleContains?.trim() || undefined,
     };
+  }
+
+  private normalizePatch(patch: Partial<ReminderEditPatch> | undefined, timezone: string): ReminderEditPatch {
+    const normalized: ReminderEditPatch = {};
+
+    if (patch?.title?.trim()) {
+      normalized.title = patch.title.trim();
+    }
+
+    if (patch?.dueAt && !Number.isNaN(new Date(patch.dueAt).getTime())) {
+      normalized.dueAt = new Date(patch.dueAt).toISOString();
+      normalized.timezone = patch.timezone || timezone;
+    } else if (patch?.timezone?.trim()) {
+      normalized.timezone = patch.timezone.trim();
+    }
+
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'recurrence')) {
+      normalized.recurrence = patch.recurrence === null ? null : this.normalizeRecurrence(patch.recurrence);
+    }
+
+    return normalized;
   }
 }
