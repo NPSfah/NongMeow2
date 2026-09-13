@@ -42,6 +42,29 @@ export class ReminderStore implements OnModuleInit {
     return record;
   }
 
+  async updateStatuses(targetId: string, ids: string[], status: ReminderStatus) {
+    const idSet = new Set(ids);
+    const updatedAt = new Date().toISOString();
+    const updated: ReminderRecord[] = [];
+
+    for (const record of this.records) {
+      if (record.targetId !== targetId || !idSet.has(record.id)) {
+        continue;
+      }
+
+      record.status = status;
+      record.updatedAt = updatedAt;
+      this.clearTimer(record.id);
+      updated.push(record);
+    }
+
+    if (updated.length > 0) {
+      await this.save();
+    }
+
+    return updated;
+  }
+
   async list() {
     return [...this.records];
   }

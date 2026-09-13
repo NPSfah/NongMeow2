@@ -174,7 +174,7 @@ export class GeminiReminderParser {
     if (parsed.intent !== 'create_reminders') {
       return {
         intent: 'unknown',
-        message: parsed.message || 'ยังไม่เข้าใจว่าให้บันทึกหรือให้ดูรายการไหน',
+        message: 'unknown intent',
       };
     }
 
@@ -202,7 +202,7 @@ export class GeminiReminderParser {
     if (validReminders.length === 0) {
       return {
         intent: 'unknown',
-        message: 'ยังไม่เจอวัน เวลา หรือเรื่องที่ต้องเตือน',
+        message: 'no valid reminders',
       };
     }
 

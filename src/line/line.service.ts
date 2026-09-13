@@ -3,19 +3,23 @@ import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
 import { randomUUID } from 'crypto';
 import { GeminiReminderParser } from '../reminders/gemini-reminder.parser';
+import { LocalCommandParser } from '../reminders/local-command.parser';
 import { ReminderStore } from '../reminders/reminder.store';
 import { BotIntent, ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
 import { LineFlexMessageFactory } from './line-flex-message.factory';
 import { LineMessageEvent, LinePostbackEvent, LineSource, LineWebhookBody, LineWebhookEvent } from './line.types';
+import { LINE_USER_MESSAGES } from './line-user-messages';
 
 @Injectable()
 export class LineService implements OnModuleInit {
   private readonly logger = new Logger(LineService.name);
   private readonly client: messagingApi.MessagingApiClient;
+  private readonly pendingCancelBatches = new Map<string, { targetId: string; ids: string[]; expiresAt: number }>();
 
   constructor(
     private readonly config: ConfigService,
     private readonly parser: GeminiReminderParser,
+    private readonly localCommands: LocalCommandParser,
     private readonly reminders: ReminderStore,
     private readonly flex: LineFlexMessageFactory,
   ) {
@@ -62,88 +66,151 @@ export class LineService implements OnModuleInit {
 
     const text = this.stripSelfMention(event.message.text, event.message.mention?.mentionees);
     this.logger.log(`Parsing reminder text from ${event.source.type}: ${text}`);
-    await this.showThinking(event);
 
     let intent: BotIntent;
+    const localCommand = this.localCommands.parse(text);
 
-    try {
-      intent = await this.parser.parse(text);
-    } catch (error) {
-      this.logger.warn(`Could not parse bot intent: ${String(error)}`);
-      await this.replyText(
-        event.replyToken,
-        'ยังบันทึกไม่ได้ ลองพิมพ์วัน เวลา และเรื่องที่ต้องเตือนให้ชัดขึ้นหน่อยนะ',
-      );
+    if (localCommand?.intent === 'direct_reply') {
+      this.logger.log(`Handled local command without Gemini: ${text}`);
+      await this.sendFinalResponse(event, { type: 'text', text: localCommand.text });
       return;
     }
 
+    if (localCommand) {
+      this.logger.log(`Handled local command without Gemini: ${text}`);
+      intent = localCommand;
+    } else {
+      await this.showThinking(event);
+
+      try {
+        intent = await this.parser.parse(text);
+      } catch (error) {
+        this.logger.warn(`Could not parse bot intent: ${String(error)}`);
+        await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.systemFailed });
+        return;
+      }
+    }
+
     if (intent.intent === 'list_reminders') {
-      const records = await this.reminders.queryByTarget(this.getTargetId(event.source), intent.query);
-      await this.sendFinalResponse(event, this.buildReminderListResponse(intent.query, records));
+      try {
+        const records = await this.reminders.queryByTarget(this.getTargetId(event.source), intent.query);
+        await this.sendFinalResponse(event, this.buildReminderListResponse(intent.query, records));
+      } catch (error) {
+        this.logger.warn(`Could not list reminders: ${String(error)}`);
+        await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.listFailed });
+      }
       return;
     }
 
     if (intent.intent === 'cancel_reminders') {
-      await this.handleCancelIntent(event, intent.query);
+      try {
+        await this.handleCancelIntent(event, intent.query);
+      } catch (error) {
+        this.logger.warn(`Could not cancel reminders: ${String(error)}`);
+        await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.systemFailed });
+      }
       return;
     }
 
     if (intent.intent === 'unknown') {
-      await this.sendFinalResponse(event, { type: 'text', text: intent.message });
+      await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.unknownIntent });
       return;
     }
 
-    const now = new Date().toISOString();
-    const targetId = this.getTargetId(event.source);
-    const records = await Promise.all(
-      intent.reminders.map((parsed) =>
-        this.reminders.create({
-          id: randomUUID(),
-          sourceType: event.source.type,
-          targetId,
-          createdByUserId: this.getUserId(event.source),
-          rawText: event.message.text,
-          title: parsed.title,
-          dueAt: parsed.dueAt,
-          timezone: parsed.timezone,
-          recurrence: parsed.recurrence,
-          status: 'pending',
-          createdAt: now,
-          updatedAt: now,
-        }),
-      ),
-    );
+    try {
+      const now = new Date().toISOString();
+      const targetId = this.getTargetId(event.source);
+      const records = await Promise.all(
+        intent.reminders.map((parsed) =>
+          this.reminders.create({
+            id: randomUUID(),
+            sourceType: event.source.type,
+            targetId,
+            createdByUserId: this.getUserId(event.source),
+            rawText: event.message.text,
+            title: parsed.title,
+            dueAt: parsed.dueAt,
+            timezone: parsed.timezone,
+            recurrence: parsed.recurrence,
+            status: 'pending',
+            createdAt: now,
+            updatedAt: now,
+          }),
+        ),
+      );
 
-    this.logger.log(`Created ${records.length} reminder(s): ${records.map((record) => record.id).join(', ')}`);
-    await this.sendFinalResponse(event, this.flex.buildConfirmationMessage(records));
+      this.logger.log(`Created ${records.length} reminder(s): ${records.map((record) => record.id).join(', ')}`);
+      await this.sendFinalResponse(event, this.flex.buildConfirmationMessage(records));
+    } catch (error) {
+      this.logger.warn(`Could not create reminders: ${String(error)}`);
+      await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.createFailed });
+    }
   }
 
   private async handlePostback(event: LinePostbackEvent) {
     const params = new URLSearchParams(event.postback.data);
     const action = params.get('action');
     const id = params.get('id');
+    const token = params.get('token');
 
-    if (!id || !action) {
+    if (!action) {
       return;
     }
 
     const targetId = this.getTargetId(event.source);
 
     if (action === 'cancel_request') {
+      if (!id) {
+        return;
+      }
+
       const record = await this.reminders.getById(targetId, id);
       await this.replyMessage(
         event.replyToken,
-        record ? this.flex.buildCancelConfirmationMessage(record) : { type: 'text', text: 'ไม่พบรายการเตือนนี้แล้ว' },
+        record
+          ? this.flex.buildCancelConfirmationMessage(record)
+          : { type: 'text', text: LINE_USER_MESSAGES.reminderNotFound },
       );
       return;
     }
 
+    if (action === 'cancel_batch_abort') {
+      if (token) {
+        this.pendingCancelBatches.delete(token);
+      }
+
+      await this.replyText(event.replyToken, LINE_USER_MESSAGES.cancelAborted);
+      return;
+    }
+
+    if (action === 'cancel_batch_confirm') {
+      if (!token) {
+        return;
+      }
+
+      const batch = this.pendingCancelBatches.get(token);
+      this.pendingCancelBatches.delete(token);
+
+      if (!batch || batch.targetId !== targetId || batch.expiresAt < Date.now()) {
+        await this.replyText(event.replyToken, LINE_USER_MESSAGES.cancelExpired);
+        return;
+      }
+
+      const records = await this.reminders.updateStatuses(targetId, batch.ids, 'cancelled');
+      await this.replyText(event.replyToken, LINE_USER_MESSAGES.cancelBatchDone(records.length));
+      return;
+    }
+
     if (action === 'cancel_abort') {
-      await this.replyText(event.replyToken, 'โอเค ไม่ยกเลิกแล้ว');
+      await this.replyText(event.replyToken, LINE_USER_MESSAGES.cancelAborted);
       return;
     }
 
     if (action === 'complete' || action === 'cancel_confirm') {
+      if (!id) {
+        return;
+      }
+
       const status = action === 'complete' ? 'completed' : 'cancelled';
       const record = await this.reminders.updateStatus(id, status);
       this.logger.log(`Postback ${action} for reminder ${id}: ${record ? 'updated' : 'not found'}`);
@@ -152,9 +219,9 @@ export class LineService implements OnModuleInit {
         event.replyToken,
         record
           ? action === 'complete'
-            ? 'รับทราบ ทำเสร็จแล้ว จะไม่เตือนรายการนี้'
-            : 'ยกเลิกการเตือนรายการนี้แล้ว'
-          : 'ไม่พบรายการเตือนนี้แล้ว',
+            ? LINE_USER_MESSAGES.completeDone
+            : LINE_USER_MESSAGES.cancelDone
+          : LINE_USER_MESSAGES.reminderNotFound,
       );
     }
   }
@@ -203,18 +270,27 @@ export class LineService implements OnModuleInit {
       return;
     }
 
-    await this.replyText(event.replyToken, 'กำลังคิดให้นะ...');
+    try {
+      await this.replyText(event.replyToken, LINE_USER_MESSAGES.groupThinking);
+    } catch (error) {
+      this.logger.warn(`Could not send group thinking message: ${String(error)}`);
+    }
   }
 
-  private async sendFinalResponse(event: LineMessageEvent, message: messagingApi.Message) {
+  private async sendFinalResponse(event: LineMessageEvent, message: messagingApi.Message | messagingApi.Message[]) {
+    const messages = Array.isArray(message) ? message : [message];
+
     if (event.source.type === 'user') {
-      await this.replyMessage(event.replyToken, message);
+      await this.client.replyMessage({
+        replyToken: event.replyToken,
+        messages,
+      });
       return;
     }
 
     await this.client.pushMessage({
       to: this.getTargetId(event.source),
-      messages: [message],
+      messages,
     });
   }
 
@@ -222,7 +298,7 @@ export class LineService implements OnModuleInit {
     const records = await this.reminders.queryByTarget(this.getTargetId(event.source), query);
 
     if (records.length === 0) {
-      await this.sendFinalResponse(event, { type: 'text', text: 'ไม่เจองานที่ตรงกับที่บอก' });
+      await this.sendFinalResponse(event, { type: 'text', text: LINE_USER_MESSAGES.cancelNoMatch });
       return;
     }
 
@@ -231,7 +307,14 @@ export class LineService implements OnModuleInit {
       return;
     }
 
-    await this.sendFinalResponse(event, this.flex.buildCancelSelectionMessage('เลือกงานที่จะยกเลิก', records));
+    const token = randomUUID();
+    this.pendingCancelBatches.set(token, {
+      targetId: this.getTargetId(event.source),
+      ids: records.map((record) => record.id),
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+
+    await this.sendFinalResponse(event, this.flex.buildBatchCancelConfirmationMessage(records, token));
   }
 
   private async replyText(replyToken: string, text: string) {
@@ -248,15 +331,15 @@ export class LineService implements OnModuleInit {
     });
   }
 
-  private buildReminderListResponse(query: ReminderQuery, records: ReminderRecord[]): messagingApi.Message {
+  private buildReminderListResponse(query: ReminderQuery, records: ReminderRecord[]): messagingApi.Message | messagingApi.Message[] {
     if (records.length === 0) {
       return {
         type: 'text',
-        text: `ยังไม่มี${query.title}ในแชตนี้`,
+        text: LINE_USER_MESSAGES.emptyList(query.title),
       };
     }
 
-    return this.flex.buildReminderListMessage(`${query.title}ในแชตนี้`, records);
+    return this.flex.buildReminderListMessages(`${query.title}ในแชตนี้`, records);
   }
 
   private getTargetId(source: LineSource) {

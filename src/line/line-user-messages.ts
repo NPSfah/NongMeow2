@@ -1,0 +1,15 @@
+export const LINE_USER_MESSAGES = {
+  unknownIntent: 'ยังไม่เข้าใจคำสั่งนี้ ลองบอกเป็นงาน + วัน/เวลา หรือถามรายการงานดูนะ',
+  createFailed: 'ยังบันทึกงานไม่ได้ ลองใส่วัน เวลา และชื่องานให้ชัดขึ้นหน่อยนะ',
+  listFailed: 'ยังดูรายการให้ไม่ได้ ลองถามใหม่ให้แคบลงหน่อยนะ',
+  cancelNoMatch: 'ไม่เจองานที่ตรงกับที่บอก',
+  systemFailed: 'ตอนนี้บอททำงานไม่สำเร็จ ลองใหม่อีกทีนะ',
+  cancelExpired: 'คำยืนยันหมดอายุแล้ว ลองสั่งยกเลิกใหม่อีกครั้ง',
+  cancelAborted: 'โอเค ไม่ยกเลิกแล้ว',
+  reminderNotFound: 'ไม่พบรายการเตือนนี้แล้ว',
+  completeDone: 'รับทราบ ทำเสร็จแล้ว จะไม่เตือนรายการนี้',
+  cancelDone: 'ยกเลิกการเตือนรายการนี้แล้ว',
+  groupThinking: 'กำลังคิดให้นะ...',
+  emptyList: (title: string) => `ยังไม่มี${title}ในแชตนี้`,
+  cancelBatchDone: (count: number) => `ยกเลิก ${count} รายการแล้ว`,
+} as const;

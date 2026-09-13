@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
 import { ReminderQuery, ReminderRecord } from '../reminders/reminder.types';
+import { LINE_USER_MESSAGES } from './line-user-messages';
 
 @Injectable()
 export class LineFlexMessageFactory {
@@ -20,32 +21,40 @@ export class LineFlexMessageFactory {
   buildReminderListMessage(title: string, records: ReminderRecord[]): messagingApi.FlexMessage {
     const oneTime = records.filter((record) => !record.recurrence);
     const recurring = records.filter((record) => record.recurrence);
+    const bubbles = [
+      ...this.buildSectionBubbles(title, 'ครั้งเดียว', oneTime),
+      ...this.buildSectionBubbles(title, 'ซ้ำ', recurring),
+    ];
 
     return {
       type: 'flex',
       altText: title,
-      contents: {
-        type: 'bubble',
-        size: 'mega',
-        body: {
-          type: 'box',
-          layout: 'vertical',
-          spacing: 'md',
-          contents: [
-            {
-              type: 'text',
-              text: title,
-              weight: 'bold',
-              size: 'lg',
-              wrap: true,
-            },
-            { type: 'separator', margin: 'sm' },
-            ...this.buildReminderSection('ครั้งเดียว', oneTime),
-            ...this.buildReminderSection('ซ้ำ', recurring),
-          ],
-        },
-      },
+      contents: bubbles.length === 1 ? bubbles[0] : { type: 'carousel', contents: bubbles.slice(0, 12) },
     };
+  }
+
+  buildReminderListMessages(title: string, records: ReminderRecord[]): messagingApi.Message[] {
+    const oneTime = records.filter((record) => !record.recurrence);
+    const recurring = records.filter((record) => record.recurrence);
+    const bubbles = [
+      ...this.buildSectionBubbles(title, 'ครั้งเดียว', oneTime),
+      ...this.buildSectionBubbles(title, 'ซ้ำ', recurring),
+    ];
+    const bubblePages = this.chunk(bubbles, 12);
+    const messages: messagingApi.Message[] = bubblePages.slice(0, 5).map((page, index) => ({
+      type: 'flex',
+      altText: bubblePages.length > 1 ? `${title} (${index + 1}/${bubblePages.length})` : title,
+      contents: page.length === 1 ? page[0] : { type: 'carousel', contents: page },
+    }));
+
+    if (bubblePages.length > 5) {
+      messages[4] = {
+        type: 'text',
+        text: `${title}\nมี ${records.length} รายการ แสดงได้บางส่วนก่อน เพราะ LINE จำกัดจำนวน bubble ต่อครั้ง`,
+      };
+    }
+
+    return messages;
   }
 
   buildCancelConfirmationMessage(record: ReminderRecord): messagingApi.FlexMessage {
@@ -95,8 +104,62 @@ export class LineFlexMessageFactory {
     };
   }
 
+  buildBatchCancelConfirmationMessage(records: ReminderRecord[], token: string): messagingApi.FlexMessage {
+    const preview = records.slice(0, 5);
+    const remainingCount = records.length - preview.length;
+
+    return {
+      type: 'flex',
+      altText: `ยืนยันยกเลิก ${records.length} รายการ`,
+      contents: {
+        type: 'bubble',
+        size: 'mega',
+        body: {
+          type: 'box',
+          layout: 'vertical',
+          spacing: 'md',
+          contents: [
+            {
+              type: 'text',
+              text: `ยืนยันยกเลิก ${records.length} รายการ?`,
+              weight: 'bold',
+              size: 'lg',
+              wrap: true,
+            },
+            ...preview.map((record) => this.textLine(`- ${record.title}`)),
+            ...(remainingCount > 0 ? [this.textLine(`และอีก ${remainingCount} รายการ`)] : []),
+            {
+              type: 'button',
+              style: 'primary',
+              color: '#D92D20',
+              margin: 'lg',
+              action: {
+                type: 'postback',
+                label: 'ยืนยันยกเลิกทั้งหมด',
+                data: `action=cancel_batch_confirm&token=${token}`,
+              },
+            },
+            {
+              type: 'button',
+              style: 'secondary',
+              action: {
+                type: 'postback',
+                label: 'ไม่ยกเลิก',
+                data: `action=cancel_batch_abort&token=${token}`,
+              },
+            },
+          ],
+        },
+      },
+    };
+  }
+
   buildCancelSelectionMessage(title: string, records: ReminderRecord[]): messagingApi.FlexMessage {
-    return this.buildReminderListMessage(title, records.slice(0, 20));
+    return this.buildReminderListMessage(title, records);
+  }
+
+  buildCancelSelectionMessages(title: string, records: ReminderRecord[]): messagingApi.Message[] {
+    return this.buildReminderListMessages(title, records);
   }
 
   buildNotificationMessage(record: ReminderRecord): messagingApi.FlexMessage {
@@ -197,8 +260,47 @@ export class LineFlexMessageFactory {
     };
   }
 
+  private buildSectionBubbles(title: string, sectionTitle: string, records: ReminderRecord[]) {
+    const pages = records.length ? this.chunk(records, 4) : [[]];
+
+    return pages.map((page, index) =>
+      this.buildReminderListBubble(
+        title,
+        pages.length > 1 ? `${sectionTitle} (${index + 1}/${pages.length})` : sectionTitle,
+        page,
+      ),
+    );
+  }
+
+  private buildReminderListBubble(
+    title: string,
+    sectionTitle: string,
+    records: ReminderRecord[],
+  ): messagingApi.FlexBubble {
+    return {
+      type: 'bubble',
+      size: 'mega',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        spacing: 'md',
+        contents: [
+          {
+            type: 'text',
+            text: title,
+            weight: 'bold',
+            size: 'lg',
+            wrap: true,
+          },
+          { type: 'separator', margin: 'sm' },
+          ...this.buildReminderSection(sectionTitle, records),
+        ],
+      },
+    };
+  }
+
   private buildReminderSection(title: string, records: ReminderRecord[]): messagingApi.FlexComponent[] {
-    return [
+    const section: messagingApi.FlexComponent[] = [
       {
         type: 'text',
         text: title,
@@ -218,6 +320,8 @@ export class LineFlexMessageFactory {
             } satisfies messagingApi.FlexComponent,
           ]),
     ];
+
+    return section;
   }
 
   private buildReminderRow(record: ReminderRecord): messagingApi.FlexComponent {
@@ -273,7 +377,7 @@ export class LineFlexMessageFactory {
 
   textListFallback(title: string, query: ReminderQuery, records: ReminderRecord[]) {
     if (records.length === 0) {
-      return `ยังไม่มี${query.title}ในแชตนี้`;
+      return LINE_USER_MESSAGES.emptyList(query.title);
     }
 
     const lines = records.slice(0, 20).map((record, index) => {
@@ -343,5 +447,13 @@ export class LineFlexMessageFactory {
   private formatDayOfWeek(day: number) {
     const labels = ['อาทิตย์', 'จันทร์', 'อังคาร', 'พุธ', 'พฤหัส', 'ศุกร์', 'เสาร์'];
     return labels[day] ?? `วันที่ ${day}`;
+  }
+
+  private chunk<T>(items: T[], size: number) {
+    const chunks: T[][] = [];
+    for (let index = 0; index < items.length; index += size) {
+      chunks.push(items.slice(index, index + size));
+    }
+    return chunks;
   }
 }
