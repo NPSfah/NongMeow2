@@ -1,6 +1,6 @@
 # NongMeow2
 
-NongMeow2 is a NestJS LINE reminder bot. It reads natural language reminders from LINE DMs or group mentions, asks Gemini to turn the text into structured reminder records, stores them locally, and sends LINE notifications when they are due.
+NongMeow2 is a NestJS LINE reminder bot. It reads natural language reminders from LINE DMs or group mentions, asks Gemini to turn the text into structured reminder records, stores them in SQLite, and sends LINE notifications when they are due.
 
 ## Features
 
@@ -40,6 +40,7 @@ GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-3.6-flash
 APP_TIMEZONE=Asia/Bangkok
 REMINDER_IMAGE_URL=https://example.com/cat-clock.jpg
+DATABASE_PATH=data/reminders.sqlite
 ```
 
 Run the development server:
@@ -116,9 +117,10 @@ cancel all overdue tasks
 1. LINE sends events to `POST /line/webhook`.
 2. The controller verifies the LINE signature using the raw request body.
 3. The service accepts DMs automatically and group messages only when the bot is mentioned.
-4. Gemini classifies the text as create, list, cancel, or unknown.
-5. Reminder records are stored in `data/reminders.json`.
-6. The scheduler sends LINE push notifications when reminders are due.
+4. Simple exact commands like `list`, `ซ้ำ`, or `help` are handled locally before calling Gemini.
+5. Gemini classifies natural-language text as create, list, cancel, or unknown.
+6. Reminder records are stored in SQLite at `data/reminders.sqlite` by default.
+7. The scheduler sends LINE push notifications when reminders are due.
 
 ## Scripts
 
@@ -131,4 +133,4 @@ npm test
 
 ## Notes
 
-`data/reminders.json` is local development storage and is ignored by Git. Use a real database before deploying this bot for production use.
+`data/reminders.sqlite` is local development storage and is ignored by Git. On startup, if the database is empty and an old `data/reminders.json` file exists, the app migrates those reminders into SQLite once.

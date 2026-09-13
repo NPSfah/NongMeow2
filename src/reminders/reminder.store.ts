@@ -1,21 +1,27 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { mkdir, readFile, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { InjectRepository } from '@nestjs/typeorm';
+import { readFile } from 'fs/promises';
+import { join } from 'path';
+import { Repository } from 'typeorm';
+import { ReminderEntity } from './reminder.entity';
 import { ReminderQuery, ReminderRecord, ReminderStatus } from './reminder.types';
 
 @Injectable()
 export class ReminderStore implements OnModuleInit {
   private readonly logger = new Logger(ReminderStore.name);
-  private readonly filePath = join(process.cwd(), 'data', 'reminders.json');
+  private readonly legacyFilePath = join(process.cwd(), 'data', 'reminders.json');
   private readonly timers = new Map<string, NodeJS.Timeout>();
-  private records: ReminderRecord[] = [];
   private onDue?: (record: ReminderRecord) => Promise<void>;
 
+  constructor(
+    @InjectRepository(ReminderEntity)
+    private readonly reminders: Repository<ReminderEntity>,
+  ) {}
+
   async onModuleInit() {
-    await this.load();
-    this.records
-      .filter((record) => record.status === 'pending')
-      .forEach((record) => this.schedule(record));
+    await this.migrateLegacyJsonIfNeeded();
+    const pending = await this.reminders.find({ where: { status: 'pending' } });
+    pending.forEach((record) => this.schedule(this.toRecord(record)));
   }
 
   setDueHandler(handler: (record: ReminderRecord) => Promise<void>) {
@@ -23,77 +29,69 @@ export class ReminderStore implements OnModuleInit {
   }
 
   async create(record: ReminderRecord) {
-    this.records.push(record);
-    await this.save();
-    this.schedule(record);
-    return record;
+    const saved = await this.reminders.save(this.toEntity(record));
+    const result = this.toRecord(saved);
+    this.schedule(result);
+    return result;
   }
 
   async updateStatus(id: string, status: ReminderStatus) {
-    const record = this.records.find((item) => item.id === id);
+    const record = await this.reminders.findOneBy({ id });
     if (!record) {
       return undefined;
     }
 
     record.status = status;
     record.updatedAt = new Date().toISOString();
+    await this.reminders.save(record);
     this.clearTimer(id);
-    await this.save();
-    return record;
+    return this.toRecord(record);
   }
 
   async updateStatuses(targetId: string, ids: string[], status: ReminderStatus) {
-    const idSet = new Set(ids);
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const records = await this.reminders
+      .createQueryBuilder('reminder')
+      .where('reminder.targetId = :targetId', { targetId })
+      .andWhere('reminder.id IN (:...ids)', { ids })
+      .getMany();
+
     const updatedAt = new Date().toISOString();
-    const updated: ReminderRecord[] = [];
-
-    for (const record of this.records) {
-      if (record.targetId !== targetId || !idSet.has(record.id)) {
-        continue;
-      }
-
+    const updated = records.map((record) => {
       record.status = status;
       record.updatedAt = updatedAt;
       this.clearTimer(record.id);
-      updated.push(record);
-    }
+      return record;
+    });
 
     if (updated.length > 0) {
-      await this.save();
+      await this.reminders.save(updated);
     }
 
-    return updated;
+    return updated.map((record) => this.toRecord(record));
   }
 
   async list() {
-    return [...this.records];
+    const records = await this.reminders.find();
+    return records.map((record) => this.toRecord(record));
   }
 
   async queryByTarget(targetId: string, query: ReminderQuery) {
     const now = Date.now();
+    const records = await this.reminders.find({ where: { targetId } });
 
-    return this.records
-      .filter((record) => record.targetId === targetId && this.matchesQuery(record, query, now))
+    return records
+      .map((record) => this.toRecord(record))
+      .filter((record) => this.matchesQuery(record, query, now))
       .sort((left, right) => new Date(left.dueAt).getTime() - new Date(right.dueAt).getTime());
   }
 
   async getById(targetId: string, id: string) {
-    return this.records.find((record) => record.targetId === targetId && record.id === id);
-  }
-
-  private async load() {
-    try {
-      const content = await readFile(this.filePath, 'utf8');
-      this.records = JSON.parse(content) as ReminderRecord[];
-    } catch {
-      this.records = [];
-      await this.save();
-    }
-  }
-
-  private async save() {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(this.records, null, 2));
+    const record = await this.reminders.findOneBy({ targetId, id });
+    return record ? this.toRecord(record) : undefined;
   }
 
   private schedule(record: ReminderRecord) {
@@ -114,7 +112,8 @@ export class ReminderStore implements OnModuleInit {
   }
 
   private async fire(id: string) {
-    const record = this.records.find((item) => item.id === id);
+    const entity = await this.reminders.findOneBy({ id });
+    const record = entity ? this.toRecord(entity) : undefined;
     if (!record || record.status !== 'pending') {
       return;
     }
@@ -128,9 +127,9 @@ export class ReminderStore implements OnModuleInit {
     try {
       await this.onDue?.(record);
       if (record.recurrence) {
-        this.advanceRecurring(record);
-        await this.save();
-        this.schedule(record);
+        const nextRecord = this.advanceRecurring(record);
+        await this.reminders.save(this.toEntity(nextRecord));
+        this.schedule(nextRecord);
       } else {
         await this.updateStatus(id, 'sent');
       }
@@ -187,9 +186,12 @@ export class ReminderStore implements OnModuleInit {
   }
 
   private advanceRecurring(record: ReminderRecord) {
-    record.lastSentAt = new Date().toISOString();
-    record.dueAt = this.getNextDueAt(record);
-    record.updatedAt = new Date().toISOString();
+    return {
+      ...record,
+      lastSentAt: new Date().toISOString(),
+      dueAt: this.getNextDueAt(record),
+      updatedAt: new Date().toISOString(),
+    };
   }
 
   private getNextDueAt(record: ReminderRecord) {
@@ -220,5 +222,46 @@ export class ReminderStore implements OnModuleInit {
 
     due.setDate(due.getDate() + dayOffsets[0]);
     return due.toISOString();
+  }
+
+  private async migrateLegacyJsonIfNeeded() {
+    if ((await this.reminders.count()) > 0) {
+      return;
+    }
+
+    try {
+      const content = await readFile(this.legacyFilePath, 'utf8');
+      const records = JSON.parse(content) as ReminderRecord[];
+      if (!records.length) {
+        return;
+      }
+
+      await this.reminders.save(records.map((record) => this.toEntity(record)));
+      this.logger.log(`Migrated ${records.length} reminder(s) from data/reminders.json to SQLite`);
+    } catch {
+      this.logger.log('No legacy reminder JSON found to migrate');
+    }
+  }
+
+  private toRecord(entity: ReminderEntity): ReminderRecord {
+    return {
+      id: entity.id,
+      sourceType: entity.sourceType,
+      targetId: entity.targetId,
+      createdByUserId: entity.createdByUserId,
+      rawText: entity.rawText,
+      title: entity.title,
+      dueAt: entity.dueAt,
+      timezone: entity.timezone,
+      recurrence: entity.recurrence,
+      lastSentAt: entity.lastSentAt,
+      status: entity.status,
+      createdAt: entity.createdAt,
+      updatedAt: entity.updatedAt,
+    };
+  }
+
+  private toEntity(record: ReminderRecord): ReminderEntity {
+    return this.reminders.create(record);
   }
 }
